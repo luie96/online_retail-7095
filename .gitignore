@@ -14,3 +14,5 @@ logs/
 .env.*
 *.tmp
 .pytest_cache/
+results/
+tmp/

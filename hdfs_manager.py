@@ -111,6 +111,78 @@ def download_from_hdfs(hdfs_path: str, local_dir: str) -> None:
         )
 
 
+def remove_hdfs_path(hdfs_path: str) -> None:
+    """
+    删除 HDFS 路径（文件或目录）。
+
+    Args:
+        hdfs_path: HDFS 路径。
+
+    Raises:
+        ValueError: 路径无效。
+        subprocess.CalledProcessError: 删除失败。
+    """
+    from logging_setup import get_logger
+
+    log = get_logger(__name__)
+    hp = _normalize_hdfs_path(hdfs_path).rstrip("/")
+    if not hp or hp == "/":
+        raise ValueError("remove_hdfs_path：hdfs_path 不能为空或为根目录 '/'")
+    base = _hdfs_base_cmd()
+    log.info("删除 HDFS 路径：%s", hp)
+    _run_cmd(base + ["-rm", "-r", "-f", hp], check=False)
+
+
+def getmerge_hdfs_dir_to_local(hdfs_dir: str, local_file: str) -> None:
+    """
+    将 HDFS 目录下的 Spark CSV 结果下载为本地单文件。
+
+    说明：
+    - Windows 上 `hdfs dfs -getmerge` 对绝对路径（如 `D:\\...`）可能报 URISyntaxException，
+      因此这里改用 `hdfs dfs -get` 下载目录，再在本地挑选 `part-*.csv` 移动为目标文件。
+
+    Args:
+        hdfs_dir: HDFS 目录路径（例如 /path/to/out_dir）。
+        local_file: 本地输出文件路径（例如 ./results/daily_sales.csv）。
+
+    Raises:
+        ValueError: 路径无效。
+        FileNotFoundError: HDFS 目录不存在。
+        subprocess.CalledProcessError: 下载失败。
+        RuntimeError: 未找到 part 文件。
+    """
+    from logging_setup import get_logger
+
+    log = get_logger(__name__)
+    hd = _normalize_hdfs_path(hdfs_dir).rstrip("/")
+    if not hd or hd == "/":
+        raise ValueError("getmerge_hdfs_dir_to_local：hdfs_dir 不能为空或为根目录 '/'")
+    lf = Path(local_file)
+    lf.parent.mkdir(parents=True, exist_ok=True)
+
+    if not check_hdfs_file_exists(hd):
+        raise FileNotFoundError(f"HDFS 目录不存在：{hd}")
+
+    try:
+        tmp_root = (Path.cwd() / "tmp" / "hdfs_get_csv").resolve()
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        tmp_root.mkdir(parents=True, exist_ok=True)
+
+        log.info("HDFS -get -> 本地临时目录：%s => %s", hd, tmp_root)
+        download_from_hdfs(hd, str(tmp_root))
+
+        parts = sorted(tmp_root.rglob("part-*.csv"))
+        if not parts:
+            raise RuntimeError(f"未找到 HDFS CSV part 文件：{tmp_root}")
+        shutil.move(str(parts[0]), str(lf.resolve()))
+        log.info("已生成本地单文件 CSV：%s", lf.resolve())
+    finally:
+        try:
+            shutil.rmtree(Path.cwd() / "tmp" / "hdfs_get_csv", ignore_errors=True)
+        except Exception:
+            pass
+
+
 def check_hdfs_file_exists(hdfs_file_path: str) -> bool:
     """
     校验 HDFS 路径是否存在（文件或目录）。

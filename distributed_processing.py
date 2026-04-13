@@ -35,21 +35,34 @@ def _write_single_csv_spark_local(df: DataFrame, filepath: str) -> None:
         RuntimeError: 未生成 part 文件。
         OSError: 磁盘错误。
     """
+    """
+    Windows 下 Spark 写本地 CSV 可能触发 Hadoop NativeIO JNI 错误；
+    为保证可复现性，这里优先通过 HDFS 临时目录导出并 getmerge 回本地单文件。
+    """
+    import hdfs_manager
+    from logging_setup import get_logger
+
+    log = get_logger(__name__)
     out = Path(filepath)
     out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.parent / f"_spark_csv_{out.stem}"
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir(parents=True, exist_ok=True)
-    file_uri = tmp.resolve().as_uri()
-    df.coalesce(1).write.mode("overwrite").option("header", True).option("encoding", "UTF-8").csv(
-        file_uri
-    )
-    parts = sorted(tmp.glob("part-*.csv"))
-    if not parts:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise RuntimeError(f"Spark 未写出 CSV 分区：{tmp}")
-    shutil.move(str(parts[0]), str(out))
-    shutil.rmtree(tmp, ignore_errors=True)
+
+    tmp_hdfs = f"{CONFIG.hdfs_results_dir.rstrip('/')}/_tmp_local_export/{out.stem}"
+    tmp_hdfs = tmp_hdfs.replace(" ", "_")
+    try:
+        # 1) 写到 HDFS 临时目录（CSV 目录结构）
+        hdfs_manager.write_result_to_hdfs(
+            df.coalesce(1),
+            tmp_hdfs,
+            write_mode="overwrite",
+            file_format="csv",
+        )
+        # 2) 合并下载到本地单文件
+        hdfs_manager.getmerge_hdfs_dir_to_local(tmp_hdfs, str(out.resolve()))
+    finally:
+        try:
+            hdfs_manager.remove_hdfs_path(tmp_hdfs)
+        except Exception as e:
+            log.warning("清理 HDFS 临时目录失败：%s", e)
 
 
 def _hdfs_result_subdir(base_name: str) -> str:
@@ -231,15 +244,17 @@ def analyze_user_behavior_summary(df: DataFrame) -> DataFrame:
     )
     order_amt = df.groupBy("InvoiceNo").agg(F.sum("TotalAmount").alias("order_value"))
     qv = order_amt.approxQuantile("order_value", [0.25, 0.5,0.75], 0.05)
-    spark = order_amt.sparkSession
-    qrow = spark.createDataFrame(
-        [
-            ("order_value_p25", float(qv[0])),
-            ("order_value_p50", float(qv[1])),
-            ("order_value_p75", float(qv[2])),
-        ],
-        ["metric", "value"],
+    # 避免使用 createDataFrame(list) 触发 Python worker 通信问题：用现有 DataFrame 构造单行常量结果
+    q25 = order_amt.limit(1).select(
+        F.lit("order_value_p25").alias("metric"), F.lit(float(qv[0])).alias("value")
     )
+    q50 = order_amt.limit(1).select(
+        F.lit("order_value_p50").alias("metric"), F.lit(float(qv[1])).alias("value")
+    )
+    q75 = order_amt.limit(1).select(
+        F.lit("order_value_p75").alias("metric"), F.lit(float(qv[2])).alias("value")
+    )
+    qrow = q25.unionByName(q50).unionByName(q75)
     w = Window.partitionBy("CustomerID").orderBy("InvoiceDateTime")
     gaps = (
         df.withColumn("prev_ts", F.lag("InvoiceDateTime").over(w))

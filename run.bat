@@ -35,24 +35,21 @@ echo ✅ JAVA_HOME=%JAVA_HOME%
 echo ✅ HADOOP_HOME=%HADOOP_HOME%
 echo.
 
-echo [3/6] 检查HDFS进程...
+echo [3/6] 校验 HDFS 可访问（hdfs dfs -ls /）...
+call hdfs dfs -ls / >nul 2>&1
+if errorlevel 1 (
+    echo ❌ HDFS 不可用：无法执行 hdfs dfs -ls /
+    echo 请先运行 "%HADOOP_HOME%\sbin\start-dfs.cmd" 启动 HDFS，并检查 HADOOP_HOME/Path 配置
+    pause
+    exit /b 1
+)
+echo ✅ HDFS 可访问
+
+rem 可选：仅作提示，不作为失败条件（部分 Windows 场景 jps 无法列出 Hadoop 守护进程）
 jps | findstr /i "NameNode DataNode SecondaryNameNode" >nul 2>&1
 if errorlevel 1 (
-    echo ❌ HDFS NameNode/DataNode/SecondaryNameNode未启动
-    echo 请先运行 %HADOOP_HOME%\sbin\start-dfs.cmd 启动HDFS
-    pause
-    exit /b 1
+    echo ⚠️ 未在 jps 中检测到 NameNode/DataNode（不影响后续，已通过 HDFS CLI 校验）
 )
-echo ✅ HDFS进程已启动
-echo [3/6] 校验 HDFS CLI 可用（hdfs dfs -ls /）...
-hdfs dfs -ls / >nul 2>&1
-if errorlevel 1 (
-    echo ❌ HDFS CLI 不可用：无法执行 hdfs dfs -ls /
-    echo 请检查 HADOOP_HOME 配置、PATH 以及 HDFS 是否正常启动
-    pause
-    exit /b 1
-)
-echo ✅ HDFS CLI 校验通过
 echo.
 
 echo [4/6] 检查Python环境...
