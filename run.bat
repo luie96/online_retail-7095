@@ -7,14 +7,17 @@ echo.
 if /i "%~1"=="perf" goto RUN_PERF
 if /i "%~1"=="performance" goto RUN_PERF
 
-echo [1/6] 检查 Kaggle online_retail.csv 数据集...
-if not exist "online_retail.csv" (
-    echo ❌ 未找到 Kaggle 数据集文件：online_retail.csv
-    echo 请将数据集放在当前目录，文件名严格为 online_retail.csv
+set "DATA_FILE=online_retail.csv"
+if not "%COMP7095_LOCAL_CSV%"=="" set "DATA_FILE=%COMP7095_LOCAL_CSV%"
+
+echo [1/6] 检查 Kaggle 数据集文件...
+if not exist "%DATA_FILE%" (
+    echo ❌ 未找到数据集文件：%DATA_FILE%
+    echo 请将数据集放在当前目录，或设置环境变量 COMP7095_LOCAL_CSV 指定文件名
     pause
     exit /b 1
 )
-echo ✅ Kaggle online_retail.csv 数据集已找到
+echo ✅ 数据集已找到：%DATA_FILE%
 echo.
 
 echo [2/6] 检查系统环境变量...
@@ -41,6 +44,15 @@ if errorlevel 1 (
     exit /b 1
 )
 echo ✅ HDFS进程已启动
+echo [3/6] 校验 HDFS CLI 可用（hdfs dfs -ls /）...
+hdfs dfs -ls / >nul 2>&1
+if errorlevel 1 (
+    echo ❌ HDFS CLI 不可用：无法执行 hdfs dfs -ls /
+    echo 请检查 HADOOP_HOME 配置、PATH 以及 HDFS 是否正常启动
+    pause
+    exit /b 1
+)
+echo ✅ HDFS CLI 校验通过
 echo.
 
 echo [4/6] 检查Python环境...

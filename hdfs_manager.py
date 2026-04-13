@@ -326,25 +326,26 @@ def read_from_hdfs(spark: SparkSession, hdfs_path: str, fmt: str = "parquet") ->
 def _write_parquet_fallback_local_put(df: DataFrame, hdfs_dir: str) -> None:
     """
     当 Spark 直接写 Parquet 在 Windows 上因 Hadoop NativeIO JNI 失败时的回退路径：
-    toPandas → pyarrow 写本地单个 Parquet → hdfs dfs -put -f 上传到目标目录（仍满足「Parquet 在 HDFS」）。
-    """
-    try:
-        import pyarrow  # noqa: F401
-    except ImportError as e:
-        raise RuntimeError(
-            "Windows 下 Spark 写出 Parquet 失败且无法使用 Hadoop 原生库；"
-            "请安装 pyarrow 以启用回退路径：pip install pyarrow"
-        ) from e
+    Spark 写本地单分区 Parquet → hdfs dfs -put -f 上传到目标目录（仍满足「Parquet 在 HDFS」）。
 
+    说明：
+    - 严禁将 Spark DataFrame 转为 Pandas 进行单机计算回退；这里保持全程 Spark 写出。
+    - 该回退仅在 Windows NativeIO JNI 兼容性问题时触发，用于保障可复现性。
+    """
     hdfs_dir = _normalize_hdfs_path(hdfs_dir).rstrip("/")
     base = _hdfs_base_cmd()
     local_root = Path.cwd() / "tmp" / "parquet_hdfs_fallback"
     shutil.rmtree(local_root, ignore_errors=True)
     local_root.mkdir(parents=True, exist_ok=True)
-    local_file = local_root / "part-00000.parquet"
+    local_uri = local_root.resolve().as_uri()
 
-    pdf = df.toPandas()
-    pdf.to_parquet(local_file, index=False)
+    # 使用 Spark 生成单文件 Parquet（本地目录结构内为 part-*.parquet）
+    df.coalesce(1).write.mode("overwrite").parquet(local_uri)
+    parts = sorted(local_root.glob("part-*.parquet"))
+    if not parts:
+        shutil.rmtree(local_root, ignore_errors=True)
+        raise RuntimeError(f"Parquet 回退写本地失败：未生成 part 文件：{local_root}")
+    local_file = parts[0]
 
     _run_cmd(base + ["-rm", "-r", "-f", hdfs_dir], check=False)
     _run_cmd(base + ["-mkdir", "-p", hdfs_dir], check=True)
