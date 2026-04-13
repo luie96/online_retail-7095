@@ -1,66 +1,125 @@
 ================================================================================
-算法 1：电商用户行为数据预处理（E-Commerce User Behavior Preprocessing）
+算法 A：HDFS 全链路（目录初始化 → 上传 → 读取 → 结果回写）
 ================================================================================
-目的：在分布式环境下对用户行为日志进行清洗、时间窗口约束、时区对齐与隐私脱敏，
-      为后续 HDFS 存储与聚合分析提供一致、可靠的列式输入。
-时间复杂度：设记录数为 n，单节点 Spark 本地模式为 O(n)；集群模式下随分区数近似线性扩展。
-空间复杂度：O(n) 用于中间 DataFrame 物化（具体由 Spark 执行计划与缓存策略决定）。
+目的：在 Windows 下通过 hdfs 子进程完成电商原始数据与分析结果的分布式存储闭环。
 
-Algorithm 1 PreprocessUserBehaviorLogs
+Algorithm A HDFSFullPipeline
 Input:
-  D: 原始日志数据集，模式为 (user_id, item_id, category_id, behavior_type, timestamp)
-  T_min, T_max: 合法 Unix 秒级时间戳下界与上界
-  TZ: 目标时区（如 Asia/Shanghai）
+  LOCAL_CSV: 本地 online_retail 路径
+  HDFS_RAW, HDFS_PROCESSED, HDFS_RESULTS: 配置中的 HDFS 路径
+  SPARK: 已构建的 SparkSession
 Output:
-  D_clean: 清洗后的数据集，附加 date, hour, day_of_week，并对 user_id 做 SHA-256 哈希
+  原始与清洗数据、分析结果均落在 HDFS；本地 results 保留单文件 CSV 副本
 Begin
-  Step 1: D_1 ← DropDuplicates(D)
-          // 去除完全重复记录，降低存储与下游偏置
-  Step 2: D_2 ← FilterMissing(D_1, keys = {user_id, item_id, category_id, behavior_type, timestamp})
-          // 删除任一键为空的行，保证行为链完整
-  Step 3: D_3 ← Filter(D_2, predicate: T_min ≤ timestamp ≤ T_max)
-          // 限制在电商活动有效时间窗内
-  Step 4: For each row r in D_3 do
-            r.dt ← ToDateTimeFromUnixSeconds(r.timestamp, timezone = TZ)
+  Step 1: InitHDFSClient()
+          CreateDirectoryTree({HDFS_ROOT, HDFS_ROOT/raw, HDFS_ROOT/processed, HDFS_RESULTS, ...})
+          // 已存在则 mkdir -p 幂等跳过
+  Step 2: If upload_mode = skip And HDFSFileExists(HDFS_RAW) Then
+            SkipUpload
+          Else
+            HdfsPut(LOCAL_CSV → HDFS_RAW, overwrite)
+          End If
+  Step 3: DF_raw ← SparkReadCSV(HDFS_RAW, encoding=latin-1, header=true, nullMarker="NA")
+  Step 4: DF_clean ← PreprocessOnlineRetail(DF_raw)
+  Step 5: SparkWriteParquet(DF_clean → HDFS_PROCESSED, mode=overwrite)
+  Step 6: DF_star ← SparkReadParquet(HDFS_PROCESSED)
+  Step 7: For each analysis module M in DistributedAnalytics do
+            R_M ← Compute(M, DF_star)
+            WriteSingleLocalCSV(R_M, ./results/M.csv)
+            SparkWriteCSV(R_M → HDFS_RESULTS/M/, mode=overwrite)
           End For
-  Step 5: For each row r in D_3 do
-            r.date ← DatePart(r.dt) formatted as "YYYY-MM-DD"
-            r.hour ← Hour(r.dt) in {0,…,23}
-            r.day_of_week ← IsoMondayZeroIndex(r.dt)  // 0 = Monday, …, 6 = Sunday
-          End For
-  Step 6: For each row r in D_3 do
-            r.user_id ← SHA256(ToString(r.user_id))
-          End For
-  Step 7: D_clean ← Project(D_3, drop raw datetime column if redundant)
+  Step 8: CloseHDFSClient()  // 子进程模式：记录日志，无长连接
+  Step 9: StopSpark(SPARK)
+End
+
+
+================================================================================
+算法 B：分布式数据预处理（Online Retail）
+================================================================================
+目的：剔除脏数据、补齐描述、生成时间与订单键、控制分区，保证下游分析一致。
+
+Algorithm B PreprocessOnlineRetail
+Input:
+  D: Spark DataFrame(InvoiceNo, StockCode, Description, Quantity, InvoiceDate, UnitPrice, CustomerID, Country)
+Output:
+  D_clean: 增加 InvoiceDateTime, InvoiceDate, InvoiceHour, Year/Month/Day, Weekday, IsWeekend,
+           OrderKey, TotalAmount, 规范数值类型
+Begin
+  Step 1: LogCount(D, "raw")
+  Step 2: D1 ← Filter(D, NOT StartsWith(Trim(InvoiceNo), "C"))     // 取消单
+  Step 3: LogCount(D1, "after cancel filter")
+  Step 4: D2 ← Filter(D1, Quantity>0 AND UnitPrice>0)
+  Step 5: LogCount(D2, "after qty/price filter")
+  Step 6: D3 ← DropDuplicates(D2)                                   // 完全重复行
+  Step 7: LogCount(D3, "after duplicate drop")
+  Step 8: D4 ← Filter(D3, CustomerID IS NOT NULL)
+          For rows with empty Description Do Description ← "Unknown Product"
+  Step 9: LogCount(D4, "after customer & description")
+  Step 10: Parse InvoiceDate → timestamp T; D5 ← Filter(D4, T IS NOT NULL)
+  Step 11: LogCount(D5, "after timestamp parse")
+  Step 12: D6 ← AddColumns(D5,
+            InvoiceDateTime=T,
+            InvoiceDate=DateFormat(T,"yyyy-MM-dd"),
+            InvoiceHour=Hour(T),
+            Year/Month/DayOfMonth/DayOfWeek/IsWeekend,
+            OrderKey=Concat(InvoiceNo, "|", CustomerID),
+            TotalAmount=Quantity*UnitPrice,
+            cast numerics)
+  Step 13: D_clean ← Repartition(D6, by CustomerID, N=config.spark_repartition_n)
+  Step 14: LogCount(D_clean, "final")
   Return D_clean
 End
 
 
 ================================================================================
-算法 2：电商用户转化漏斗计算（Conversion Funnel from Page View）
+算法 C：分布式分析核心逻辑（示例聚合 + RFM + FP-Growth）
 ================================================================================
-目的：在固定阶段顺序 {pv, fav, cart, buy} 下统计各阶段事件量，并以 pv 阶段为基准计算
-      相对转化率，支撑运营侧漏斗诊断与可视化。
-时间复杂度：O(n) 扫描行为日志（可通过一次或数次聚合实现）；实现中若逐阶段 count 则为 O(4n)。
-空间复杂度：O(1) 额外空间存储四个计数（不含输入数据本身）。
+目的：全程 Spark DataFrame 算子，输出可可视化结构化结果。
 
-Algorithm 2 ComputeConversionFunnel
+Algorithm C DistributedRetailAnalytics
 Input:
-  D_clean: 预处理后的行为数据集，字段 behavior_type ∈ {pv, fav, cart, buy}
-  Order: 阶段序列 L ← [pv, fav, cart, buy]
+  D_clean: 算法 B 输出
 Output:
-  F: 表 (stage, count, conversion_rate_from_pv)，按 L 的顺序排列
+  多张指标表 {daily_sales, top20_products, country_sales, customer_frequency, hourly_orders,
+              rfm_segments, association_rules, user_behavior_summary, ...}
 Begin
-  Step 1: N_pv ← CountRows(D_clean, behavior_type = "pv")
-  Step 2: Initialize empty result list F
-  Step 3: For each stage s in L do
-            N_s ← CountRows(D_clean, behavior_type = s)
-            If N_pv > 0 then
-              ρ_s ← N_s / N_pv
-            Else
-              ρ_s ← 0
-            End If
-            Append (s, N_s, ρ_s) to F
+  Step 1: D ← Repartition(D_clean, N=config.spark_repartition_n)
+  Step 2: Daily ← GroupBy(D, InvoiceDate) Agg countDistinct(InvoiceNo), sum(TotalAmount), sum(Quantity)
+  Step 3: Top20 ← GroupBy(D, StockCode, Description) Agg sum(Qty), sum(Amount) OrderBy desc Limit 20
+  Step 4: Country ← GroupBy(D, Country) Agg countDistinct(InvoiceNo), sum(Amount), countDistinct(CustomerID)
+  Step 5: CustFreq ← GroupBy(D, CustomerID) Agg countDistinct(InvoiceNo), sum(Amount), avg(line Amount)
+  Step 6: Hourly ← GroupBy(D, InvoiceHour) Agg countDistinct(InvoiceNo), sum(Amount)
+  Step 7: RFM ← PerCustomer(D) compute RecencyDays, Frequency, Monetary; ntile quartiles; map segments
+  Step 8: Baskets ← GroupBy(D, InvoiceNo) Agg collect_set(StockCode) as items where size(items)≥2
+          Rules ← FPGrowth(Baskets, minSupport, minConfidence) → associationRules(lift, confidence, support)
+  Step 9: Behavior ← metrics: repurchase_rate, order_value quantiles, avg gap days between orders (Window+lag)
+  Step 10: Persist each result to local single CSV and HDFS directory
+End
+
+
+================================================================================
+算法 D：性能测试流程（Pandas vs PySpark）
+================================================================================
+目的：记录不同数据比例与 shuffle 分区下的耗时，生成 Markdown 表与 Matplotlib 图。
+
+Algorithm D PerformanceBenchmark
+Input:
+  LOCAL_CSV, fractions={0.25,0.5,0.75,1.0}, partitions={2,4,8,16}
+Output:
+  performance_report.md, perf_spark_partitions.png, perf_scale_compare.png
+Begin
+  Step 1: Estimate row count of LOCAL_CSV (header excluded)
+  Step 2: For each f in fractions Do
+            t_p ← Time( PandasReadSample(nrows=f*N) + PandasClean + GroupBys )
+            Record PandasTime[f] ← t_p
           End For
-  Step 4: Return F ordered by position of s in L
+  Step 3: For each f in fractions Do
+            For each p in partitions Do
+              Start SparkSession; set spark.sql.shuffle.partitions ← p
+              t_s ← Time( SparkReadCSV + optional sample(f) + SparkClean + GroupBys )
+              Record SparkTime[f,p] ← t_s; Stop SparkSession
+            End For
+          End For
+  Step 4: Emit Markdown tables from PandasTime and SparkTime matrices
+  Step 5: Plot line chart SparkTime[1.0, p] vs p; bar chart Pandas vs Spark at chosen p for each f
 End

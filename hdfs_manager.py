@@ -9,7 +9,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from py4j.protocol import Py4JJavaError
 from pyspark.sql import DataFrame, SparkSession
@@ -111,22 +111,72 @@ def download_from_hdfs(hdfs_path: str, local_dir: str) -> None:
         )
 
 
-def upload_to_hdfs(local_path: str, hdfs_path: str) -> None:
+def check_hdfs_file_exists(hdfs_file_path: str) -> bool:
     """
-    功能：将本地文件上传至 HDFS；-put -f 覆盖已存在目标（等价断点策略：重复执行可覆盖）。
-    输入参数：
-        local_path — 本地 CSV 等文件；
-        hdfs_path — 目标 HDFS 文件路径（如 /ecommerce/raw/ecommerce_user_behavior.csv）。
-    输出结果：无；成功则文件在 HDFS 可用。
-    异常场景：
-        FileNotFoundError — 本地文件不存在；
-        subprocess.CalledProcessError — hdfs 命令失败（会先尝试放宽权限后重试一次）。
-    """
-    local = _normalize_local_path(local_path)
-    if not os.path.isfile(local):
-        raise FileNotFoundError(f"本地文件不存在，无法上传：{local}")
+    校验 HDFS 路径是否存在（文件或目录）。
 
-    target = _normalize_hdfs_path(hdfs_path)
+    Args:
+        hdfs_file_path: HDFS 逻辑路径。
+
+    Returns:
+        存在为 True，否则 False。
+    """
+    from logging_setup import get_logger
+
+    log = get_logger(__name__)
+    hp = _normalize_hdfs_path(hdfs_file_path)
+    if not hp or hp == "/":
+        log.warning("check_hdfs_file_exists：路径无效 %s", hdfs_file_path)
+        return False
+    base = _hdfs_base_cmd()
+    try:
+        cp = subprocess.run(
+            base + ["-test", "-e", hp],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        ok = cp.returncode == 0
+        log.debug("HDFS test -e %s => %s", hp, ok)
+        return ok
+    except Exception as e:
+        log.error("check_hdfs_file_exists 异常：%s", e)
+        return False
+
+
+def init_hdfs_dir() -> None:
+    """
+    自动创建项目所需 HDFS 目录（已存在则跳过）。
+
+    Raises:
+        EnvironmentError: HADOOP_HOME 未设置。
+        subprocess.CalledProcessError: mkdir 失败且重试仍失败。
+    """
+    from config import CONFIG
+    from logging_setup import get_logger
+
+    log = get_logger(__name__)
+    base = _hdfs_base_cmd()
+    for d in CONFIG.hdfs_subdirs_to_create():
+        hp = _normalize_hdfs_path(d)
+        try:
+            _run_cmd(base + ["-mkdir", "-p", hp], check=True)
+            log.info("HDFS 目录就绪：%s", hp)
+        except subprocess.CalledProcessError as e:
+            err = (e.stderr or "") + (e.stdout or "")
+            if "Permission denied" in err or "permission" in err.lower():
+                _try_fix_permissions("/".join(hp.split("/")[:-1]) or "/")
+                _run_cmd(base + ["-mkdir", "-p", hp], check=True)
+                log.info("HDFS 目录就绪（权限修复后）：%s", hp)
+            else:
+                log.exception("创建 HDFS 目录失败：%s", hp)
+                raise
+
+
+def _put_local_file_to_hdfs(local: str, target: str) -> None:
+    """内部：将本地文件 put 到 HDFS target（覆盖）。"""
+    target = _normalize_hdfs_path(target)
     parent = "/".join(target.split("/")[:-1]) or "/"
     base = _hdfs_base_cmd()
 
@@ -140,17 +190,61 @@ def upload_to_hdfs(local_path: str, hdfs_path: str) -> None:
         err = (e.stderr or "") + (e.stdout or "")
         if "Permission denied" in err or "permission" in err.lower():
             _try_fix_permissions(parent)
-            try:
-                _put()
-            except subprocess.CalledProcessError as e2:
-                raise subprocess.CalledProcessError(
-                    e2.returncode,
-                    e2.cmd,
-                    output=e2.stdout,
-                    stderr=e2.stderr,
-                ) from e2
+            _put()
         else:
             raise
+
+
+def upload_local_data_to_hdfs(
+    local_file_path: str,
+    hdfs_target_path: str,
+    *,
+    upload_mode: Optional[str] = None,
+) -> None:
+    """
+    将本地数据上传至 HDFS；支持 skip/overwrite 策略。
+
+    Args:
+        local_file_path: 本地文件绝对或相对路径。
+        hdfs_target_path: HDFS 目标文件路径。
+        upload_mode: 覆盖 CONFIG.hdfs_upload_mode；overwrite 或 skip。
+
+    Raises:
+        FileNotFoundError: 本地文件不存在。
+        subprocess.CalledProcessError: hdfs 命令失败。
+    """
+    from config import CONFIG
+    from logging_setup import get_logger
+
+    log = get_logger(__name__)
+    mode = (upload_mode or CONFIG.hdfs_upload_mode or "overwrite").lower().strip()
+    local = _normalize_local_path(local_file_path)
+    if not os.path.isfile(local):
+        raise FileNotFoundError(f"本地文件不存在，无法上传：{local}")
+    target = _normalize_hdfs_path(hdfs_target_path)
+    if mode == "skip" and check_hdfs_file_exists(target):
+        log.info("upload_mode=skip，目标已存在，跳过上传：%s", target)
+        return
+    log.info("上传本地文件 -> HDFS：%s => %s (mode=%s)", local, target, mode)
+    try:
+        _put_local_file_to_hdfs(local, target)
+    except subprocess.CalledProcessError as e:
+        log.error("上传 HDFS 失败：%s", e.stderr or e.stdout)
+        raise
+
+
+def upload_to_hdfs(local_path: str, hdfs_path: str) -> None:
+    """
+    功能：将本地文件上传至 HDFS；-put -f 覆盖已存在目标（等价断点策略：重复执行可覆盖）。
+    输入参数：
+        local_path — 本地 CSV 等文件；
+        hdfs_path — 目标 HDFS 文件路径（如 /ecommerce/raw/ecommerce_user_behavior.csv）。
+    输出结果：无；成功则文件在 HDFS 可用。
+    异常场景：
+        FileNotFoundError — 本地文件不存在；
+        subprocess.CalledProcessError — hdfs 命令失败（会先尝试放宽权限后重试一次）。
+    """
+    upload_local_data_to_hdfs(local_path, hdfs_path, upload_mode="overwrite")
 
 
 def list_hdfs_dir(hdfs_path: str) -> List[str]:
@@ -308,3 +402,99 @@ def write_parquet_to_hdfs(df: DataFrame, hdfs_path: str) -> None:
             _write()
         else:
             raise
+
+
+def read_data_from_hdfs(
+    hdfs_file_path: str,
+    spark_session: SparkSession,
+    *,
+    fmt: str = "csv",
+) -> DataFrame:
+    """
+    从 HDFS 读取数据为 Spark DataFrame（与 PySpark 规范一致，路径自动 qualify）。
+
+    Args:
+        hdfs_file_path: HDFS 文件或目录路径。
+        spark_session: SparkSession。
+        fmt: csv 或 parquet。
+
+    Returns:
+        DataFrame。
+
+    Raises:
+        ValueError: 不支持的格式。
+    """
+    from logging_setup import get_logger
+
+    log = get_logger(__name__)
+    fmt_l = (fmt or "csv").lower().strip()
+    log.info("从 HDFS 读取：%s 格式=%s", hdfs_file_path, fmt_l)
+    if fmt_l == "csv":
+        full = _hdfs_qualified_path(spark_session, hdfs_file_path)
+        return (
+            spark_session.read.option("header", True)
+            .option("encoding", "ISO-8859-1")
+            .option("inferSchema", "true")
+            .option("nullValue", "NA")
+            .csv(full)
+        )
+    if fmt_l == "parquet":
+        return read_from_hdfs(spark_session, hdfs_file_path, fmt="parquet")
+    raise ValueError(f"read_data_from_hdfs 不支持格式：{fmt}")
+
+
+def write_result_to_hdfs(
+    df: DataFrame,
+    hdfs_output_path: str,
+    write_mode: str = "overwrite",
+    *,
+    file_format: str = "csv",
+) -> None:
+    """
+    将分析结果写入 HDFS，支持 parquet 或 csv（csv 为 Spark 多 part 目录结构）。
+
+    Args:
+        df: 结果 DataFrame。
+        hdfs_output_path: HDFS 输出目录路径。
+        write_mode: Spark 写入模式，如 overwrite、append。
+        file_format: parquet 或 csv。
+
+    Raises:
+        ValueError: 不支持的 file_format。
+    """
+    from logging_setup import get_logger
+
+    log = get_logger(__name__)
+    path = _normalize_hdfs_path(hdfs_output_path).rstrip("/")
+    fmt = (file_format or "csv").lower().strip()
+    qualified = _hdfs_qualified_path(df.sparkSession, path)
+    hconf = df.sparkSession.sparkContext._jsc.hadoopConfiguration()
+    hconf.setBoolean("io.native.lib.available", False)
+    log.info("写入 HDFS 结果：%s format=%s mode=%s", qualified, fmt, write_mode)
+    try:
+        if fmt == "parquet":
+            df.write.mode(write_mode).parquet(qualified)
+        elif fmt == "csv":
+            df.write.mode(write_mode).option("header", True).option("encoding", "UTF-8").csv(qualified)
+        else:
+            raise ValueError(f"write_result_to_hdfs 不支持格式：{file_format}")
+    except Py4JJavaError as e:
+        msg = str(e).lower()
+        parent = "/".join(path.split("/")[:-1]) or "/"
+        if "permission" in msg or "access" in msg:
+            _try_fix_permissions(parent)
+            if fmt == "parquet":
+                df.write.mode(write_mode).parquet(qualified)
+            else:
+                df.write.mode(write_mode).option("header", True).option("encoding", "UTF-8").csv(qualified)
+        else:
+            raise
+
+
+def close_hdfs_client() -> None:
+    """
+    安全关闭 HDFS 客户端。当前实现基于 hdfs 子进程，无长连接，仅记录日志。
+    """
+    from logging_setup import get_logger
+
+    get_logger(__name__).info("HDFS 客户端已关闭（subprocess 模式无持久连接）。")

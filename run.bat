@@ -4,6 +4,8 @@ echo ========================================
 echo COMP7095 Kaggle online_retail 全流程启动
 echo ========================================
 echo.
+if /i "%~1"=="perf" goto RUN_PERF
+if /i "%~1"=="performance" goto RUN_PERF
 
 echo [1/6] 检查 Kaggle online_retail.csv 数据集...
 if not exist "online_retail.csv" (
@@ -61,6 +63,9 @@ if errorlevel 1 (
 )
 echo ✅ 依赖包检查通过
 echo.
+python -c "import pyspark; print('PySpark', pyspark.__version__)" 2>nul
+if errorlevel 1 echo ⚠️ 无法打印 PySpark 版本，请检查 pip 安装
+echo.
 
 echo [6/6] 启动全流程代码...
 set "HADOOP_OPTS=-Dio.native.lib.available=false %HADOOP_OPTS%"
@@ -79,3 +84,19 @@ echo 📊 结果文件已保存到 ./results/ 目录
 echo 📝 错误日志：./error.log
 echo ========================================
 pause
+exit /b 0
+
+:RUN_PERF
+echo [性能测试] 将运行 performance_test（耗时较长）...
+set "HADOOP_OPTS=-Dio.native.lib.available=false %HADOOP_OPTS%"
+set "SPARK_HADOOP_OPTS=-Dio.native.lib.available=false %SPARK_HADOOP_OPTS%"
+pip install -r requirements.txt -q
+python main.py --perf
+if errorlevel 1 (
+    echo ❌ 性能测试失败
+    pause
+    exit /b 1
+)
+echo ✅ 性能测试完成，见 results\performance_report.md 与 perf_*.png
+pause
+exit /b 0

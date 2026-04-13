@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-模块5：全流程调度入口 — Kaggle online_retail.csv（Windows + HDFS）
+模块5：全流程调度入口 — Kaggle online_retail.csv（Windows + HDFS + PySpark）
 """
 
 from __future__ import annotations
@@ -16,10 +16,7 @@ import data_loader
 import distributed_processing
 import hdfs_manager
 import preprocess
-
-HDFS_RAW_FILE = "/ecommerce/raw/kaggle_online_retail.csv"
-HDFS_PROCESSED_DIR = "/ecommerce/processed/kaggle_cleaned_data"
-KAGGLE_CSV = "online_retail.csv"
+from config import CONFIG
 
 
 def init_windows_environment() -> None:
@@ -44,8 +41,13 @@ def init_windows_environment() -> None:
 
 
 def _log_env() -> None:
+    from logging_setup import get_logger
+
+    log = get_logger(__name__)
     jh = os.environ.get("JAVA_HOME", "")
     hh = os.environ.get("HADOOP_HOME", "")
+    log.info("JAVA_HOME=%s", jh or "(未设置)")
+    log.info("HADOOP_HOME=%s", hh or "(未设置)")
     print(f"[环境] JAVA_HOME={jh or '(未设置)'}")
     print(f"[环境] HADOOP_HOME={hh or '(未设置)'}")
 
@@ -70,72 +72,103 @@ def _write_error_log(err_path: Path, exc: BaseException) -> None:
     )
 
 
-def _check_kaggle_file() -> None:
-    """前置：确认 Kaggle 数据文件存在。"""
-    p = Path.cwd() / KAGGLE_CSV
+def _check_kaggle_local_file() -> None:
+    """前置：确认本地 Kaggle 数据文件存在（用于上传 HDFS）。"""
+    p = Path(CONFIG.local_csv_path())
     if not p.is_file():
         raise FileNotFoundError(
-            f"未找到 {KAGGLE_CSV}，请将 Kaggle 数据集放在项目根目录，文件名严格为 online_retail.csv"
+            f"未找到本地 {p.name}，请将数据集放在项目根目录，或通过 COMP7095_LOCAL_CSV 指定文件名"
         )
 
 
 def main() -> int:
+    from logging_setup import setup_logging, get_logger
+
+    setup_logging()
+    log = get_logger(__name__)
     err_path = _reset_error_log()
     init_windows_environment()
     _log_env()
 
+    if "--perf" in sys.argv or CONFIG.run_performance_test:
+        log.info("进入性能测试模式")
+        try:
+            import performance_test
+
+            return performance_test.main()
+        except Exception as e:
+            _write_error_log(err_path, e)
+            log.exception("性能测试失败：%s", e)
+            print(f"\n❌ 性能测试失败，详情见 error.log：{e}", file=sys.stderr)
+            return 1
+
     spark = None
     try:
-        _check_kaggle_file()
+        _check_kaggle_local_file()
 
         print("=" * 50)
-        print("【步骤 1/5】读取 Kaggle online_retail.csv 数据集")
+        print("【步骤 1/6】初始化 HDFS 目录")
         print("=" * 50)
-        spark = preprocess.build_spark_session("COMP7095KaggleRetail")
-        spark_df = data_loader.load_kaggle_ecommerce_data(
-            spark, file_path=KAGGLE_CSV
-        )
-        if spark_df is None:
-            raise RuntimeError("Kaggle 数据集读取失败，终止流程")
+        hdfs_manager.init_hdfs_dir()
 
         print("\n" + "=" * 50)
-        print("【步骤 2/5】预处理 Kaggle online_retail.csv 数据集")
+        print("【步骤 2/6】上传本地 CSV 至 HDFS")
         print("=" * 50)
+        hdfs_manager.upload_local_data_to_hdfs(
+            CONFIG.local_csv_path(),
+            CONFIG.hdfs_raw_file,
+        )
+
+        print("\n" + "=" * 50)
+        print("【步骤 3/6】从 HDFS 读取数据并预处理")
+        print("=" * 50)
+        spark = preprocess.build_spark_session(CONFIG.spark_app_name)
+        spark_df = data_loader.load_kaggle_ecommerce_data_from_hdfs(spark)
+        if spark_df is None:
+            raise RuntimeError("从 HDFS 读取 Kaggle 数据集失败，终止流程")
         df_cleaned = preprocess.preprocess_kaggle_data(spark_df)
 
         print("\n" + "=" * 50)
-        print("【步骤 3/5】存储数据到 HDFS（Kaggle 零售数据）")
+        print("【步骤 4/6】预处理结果写入 HDFS（Parquet）")
         print("=" * 50)
-        local_csv = data_loader.normalize_local_path(KAGGLE_CSV)
-        hdfs_manager.upload_to_hdfs(local_csv, HDFS_RAW_FILE)
-        print("       ✅ 原始 CSV 已上传 HDFS。")
-        hdfs_manager.write_parquet_to_hdfs(df_cleaned, HDFS_PROCESSED_DIR)
+        hdfs_manager.write_parquet_to_hdfs(df_cleaned, CONFIG.hdfs_processed_dir)
         print("       ✅ 预处理 Parquet 已写入 HDFS。")
 
         print("\n" + "=" * 50)
-        print("【步骤 4/5】Kaggle 零售数据分布式计算")
+        print("【步骤 5/6】从 HDFS 回读清洗数据并执行分布式分析")
         print("=" * 50)
-        hdfs_manager.list_hdfs_dir(HDFS_PROCESSED_DIR)
-        distributed_processing.process_kaggle_retail_data(df_cleaned, "./results")
+        hdfs_manager.list_hdfs_dir(CONFIG.hdfs_processed_dir)
+        df_for_analysis = hdfs_manager.read_data_from_hdfs(
+            CONFIG.hdfs_processed_dir,
+            spark,
+            fmt="parquet",
+        )
+        results_dir = str(Path.cwd() / CONFIG.local_results_dir)
+        distributed_processing.process_kaggle_retail_data(df_for_analysis, results_dir)
 
         print("\n" + "=" * 50)
-        print("【步骤 5/5】校验结果文件")
+        print("【步骤 6/6】校验结果文件")
         print("=" * 50)
         if not distributed_processing.verify_results_written():
-            raise RuntimeError("results 目录下 5 个 Kaggle 结果 CSV 缺失或为空。")
+            raise RuntimeError("results 目录下部分结果 CSV 缺失或为空。")
 
         print("\n" + "=" * 50)
         print("✅ Kaggle online_retail.csv 全流程执行完成！")
-        print(f"📊 结果文件路径：{os.path.abspath('./results')}")
+        print(f"📊 结果文件路径：{os.path.abspath(results_dir)}")
         print("=" * 50)
         return 0
 
     except Exception as e:
         _write_error_log(err_path, e)
+        log.exception("流程执行失败：%s", e)
         print(f"\n❌ 流程执行失败，详情见 error.log：{e}", file=sys.stderr)
         return 1
 
     finally:
+        try:
+            hdfs_manager.close_hdfs_client()
+        except Exception:
+            pass
         if spark is not None:
             try:
                 spark.stop()
