@@ -1,0 +1,8 @@
+# COMP7095 — Kaggle online_retail 流水线（Windows）
+# 核心：pyspark、pandas（tips 要求）。pyarrow/numpy 供 hdfs_manager 写 HDFS Parquet 回退及数值运算。
+# Python 3.12+ 需 PySpark 3.5+；JDK8 请勿使用 PySpark 4.x。
+pyspark>=3.3.0,<4.0.0
+pandas>=1.5.0,<2.3.0
+pyarrow>=12.0.0
+numpy>=1.23.0
+setuptools>=69.0.0

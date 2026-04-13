@@ -1,0 +1,66 @@
+================================================================================
+算法 1：电商用户行为数据预处理（E-Commerce User Behavior Preprocessing）
+================================================================================
+目的：在分布式环境下对用户行为日志进行清洗、时间窗口约束、时区对齐与隐私脱敏，
+      为后续 HDFS 存储与聚合分析提供一致、可靠的列式输入。
+时间复杂度：设记录数为 n，单节点 Spark 本地模式为 O(n)；集群模式下随分区数近似线性扩展。
+空间复杂度：O(n) 用于中间 DataFrame 物化（具体由 Spark 执行计划与缓存策略决定）。
+
+Algorithm 1 PreprocessUserBehaviorLogs
+Input:
+  D: 原始日志数据集，模式为 (user_id, item_id, category_id, behavior_type, timestamp)
+  T_min, T_max: 合法 Unix 秒级时间戳下界与上界
+  TZ: 目标时区（如 Asia/Shanghai）
+Output:
+  D_clean: 清洗后的数据集，附加 date, hour, day_of_week，并对 user_id 做 SHA-256 哈希
+Begin
+  Step 1: D_1 ← DropDuplicates(D)
+          // 去除完全重复记录，降低存储与下游偏置
+  Step 2: D_2 ← FilterMissing(D_1, keys = {user_id, item_id, category_id, behavior_type, timestamp})
+          // 删除任一键为空的行，保证行为链完整
+  Step 3: D_3 ← Filter(D_2, predicate: T_min ≤ timestamp ≤ T_max)
+          // 限制在电商活动有效时间窗内
+  Step 4: For each row r in D_3 do
+            r.dt ← ToDateTimeFromUnixSeconds(r.timestamp, timezone = TZ)
+          End For
+  Step 5: For each row r in D_3 do
+            r.date ← DatePart(r.dt) formatted as "YYYY-MM-DD"
+            r.hour ← Hour(r.dt) in {0,…,23}
+            r.day_of_week ← IsoMondayZeroIndex(r.dt)  // 0 = Monday, …, 6 = Sunday
+          End For
+  Step 6: For each row r in D_3 do
+            r.user_id ← SHA256(ToString(r.user_id))
+          End For
+  Step 7: D_clean ← Project(D_3, drop raw datetime column if redundant)
+  Return D_clean
+End
+
+
+================================================================================
+算法 2：电商用户转化漏斗计算（Conversion Funnel from Page View）
+================================================================================
+目的：在固定阶段顺序 {pv, fav, cart, buy} 下统计各阶段事件量，并以 pv 阶段为基准计算
+      相对转化率，支撑运营侧漏斗诊断与可视化。
+时间复杂度：O(n) 扫描行为日志（可通过一次或数次聚合实现）；实现中若逐阶段 count 则为 O(4n)。
+空间复杂度：O(1) 额外空间存储四个计数（不含输入数据本身）。
+
+Algorithm 2 ComputeConversionFunnel
+Input:
+  D_clean: 预处理后的行为数据集，字段 behavior_type ∈ {pv, fav, cart, buy}
+  Order: 阶段序列 L ← [pv, fav, cart, buy]
+Output:
+  F: 表 (stage, count, conversion_rate_from_pv)，按 L 的顺序排列
+Begin
+  Step 1: N_pv ← CountRows(D_clean, behavior_type = "pv")
+  Step 2: Initialize empty result list F
+  Step 3: For each stage s in L do
+            N_s ← CountRows(D_clean, behavior_type = s)
+            If N_pv > 0 then
+              ρ_s ← N_s / N_pv
+            Else
+              ρ_s ← 0
+            End If
+            Append (s, N_s, ρ_s) to F
+          End For
+  Step 4: Return F ordered by position of s in L
+End
